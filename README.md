@@ -82,10 +82,16 @@ openspec workset create bwaai2 \
   --member /Users/miguel/git/bwaai2/bwaai2-store
 ```
 
-6. Set bwaai2 openspec store folder and start your agent:
+6. Initialize bwaai2 openspec store folder and start your agent:
 ```shell
 cd /Users/miguel/git/bwaai2/bwaai2-store
+openspec init
 agy
+
+                  Antigravity CLI 1.4.12
+                  masalinas.gancedo@gmail.com (Google AI Pro)
+                  Gemini 3.8 Flash (High)
+                  ~/git/bwaai2-bak/bwaai2-store
 ```
 
 ### `bwaai2-store`: specs and contract
