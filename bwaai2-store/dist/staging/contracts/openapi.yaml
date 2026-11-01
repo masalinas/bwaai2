@@ -1,0 +1,789 @@
+openapi: 3.1.0
+info:
+  title: Async PDF Processing API
+  version: 1.0.0
+  description: |
+    Authoritative OpenAPI 3.1 contract for the asynchronous PDF parsing and summarization service.
+    
+    ### Flow Overview
+    1. **Upload**: Client uploads 1..N PDF files via `POST /documents`, selecting a parser (`pypdf`, `gemini`, or `mistral`).
+    2. **Ingestion & Enqueue**: The API validates the files, stores them, enqueues an independent background job per file onto Redis Streams, and immediately responds with `202 Accepted`.
+    3. **Background Processing**: Workers parse each PDF (`pypdf` produces plain text; `gemini` and `mistral` produce Markdown), then generate a consolidated summary using Gemini.
+    4. **Polling & Retrieval**: The client polls `GET /documents/{document_id}/status` using the `Retry-After` header hint. Once completed (`done`), the client fetches full results (pages and summary) from `GET /documents/{document_id}`.
+    
+    ### Limits and Constraints
+    - Maximum files per upload batch: **10 files** (`x-max-files-per-request: 10`).
+    - Maximum file size per PDF: **25 MB** (26,214,400 bytes, `x-max-file-size-bytes: 26214400`).
+    - Accepted MIME type: strictly `application/pdf`.
+    - Recommended polling interval: **3 seconds** (`x-recommended-poll-interval-seconds: 3`).
+  contact:
+    name: API Support
+    url: https://github.com/bwaai2/bwaai2-store
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: /api/v1
+    description: Relative API path for local and gateway routing
+  - url: https://api.pdfprocessor.internal/v1
+    description: Internal production gateway
+
+security: []
+
+tags:
+  - name: documents
+    description: Document upload, processing lifecycle tracking, paginated listing, and parsed content retrieval.
+  - name: system
+    description: Operational health inspection and system diagnostics.
+
+paths:
+  /documents:
+    post:
+      operationId: uploadDocuments
+      summary: Upload and enqueue PDF documents for asynchronous processing
+      description: |
+        Accepts 1 to 10 PDF files via `multipart/form-data` with an optional parser selection.
+        Each file is enqueued as an independent worker job in Redis Streams.
+        Returns `202 Accepted` immediately with the list of generated document identifiers and initial `queued` statuses.
+      tags:
+        - documents
+      x-max-files-per-request: 10
+      x-max-file-size-bytes: 26214400
+      requestBody:
+        required: true
+        description: Multipart payload containing PDF file streams and parser configuration.
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - files
+              properties:
+                files:
+                  type: array
+                  description: One or more PDF documents to parse and summarize.
+                  minItems: 1
+                  maxItems: 10
+                  items:
+                    type: string
+                    format: binary
+                    description: Binary PDF file payload (application/pdf).
+                parser:
+                  $ref: '#/components/schemas/ParserType'
+                  default: pypdf
+            encoding:
+              files:
+                contentType: application/pdf
+      responses:
+        '202':
+          description: Documents accepted and queued for processing.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/DocumentUploadItem'
+              example:
+                - document_id: "doc_01j9a8b7c6d5e4f3a2b1c0d9e8"
+                  filename: "annual_report_2026.pdf"
+                  status: "queued"
+                - document_id: "doc_01j9a8b7c6d5e4f3a2b1c0d9e9"
+                  filename: "financial_appendix.pdf"
+                  status: "queued"
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '413':
+          $ref: '#/components/responses/PayloadTooLargeError'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaTypeError'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntityError'
+        '429':
+          $ref: '#/components/responses/TooManyRequestsError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    get:
+      operationId: listDocuments
+      summary: List documents with pagination and status
+      description: |
+        Retrieves a paginated list of uploaded documents sorted chronologically in descending order.
+        Includes document metadata, parser selection, processing status, and timestamps.
+      tags:
+        - documents
+      parameters:
+        - $ref: '#/components/parameters/LimitQueryParam'
+        - $ref: '#/components/parameters/CursorQueryParam'
+      responses:
+        '200':
+          description: Paginated collection of document records.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentListResponse'
+              example:
+                items:
+                  - document_id: "doc_01j9a8b7c6d5e4f3a2b1c0d9e8"
+                    filename: "annual_report_2026.pdf"
+                    parser: "gemini"
+                    status: "done"
+                    created_at: "2026-10-30T10:00:00Z"
+                    updated_at: "2026-10-30T10:02:15Z"
+                  - document_id: "doc_01j9a8b7c6d5e4f3a2b1c0d9e9"
+                    filename: "financial_appendix.pdf"
+                    parser: "pypdf"
+                    status: "processing"
+                    created_at: "2026-10-30T10:05:00Z"
+                    updated_at: "2026-10-30T10:05:12Z"
+                next_cursor: "eyJjcmVhdGVkX2F0IjoiMjAyNi0xMC0zMFQxMDowNTowMFoifQ=="
+                has_more: true
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntityError'
+        '429':
+          $ref: '#/components/responses/TooManyRequestsError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /documents/{document_id}:
+    get:
+      operationId: getDocument
+      summary: Retrieve full document details, parsed pages, and summary
+      description: |
+        Retrieves detailed information for a specific document.
+        - When `status` is `summarizing`, `done`, or `failed` after parsing succeeded, includes the `pages` array with extracted text/markdown content.
+        - When `status` is `done`, includes the consolidated Gemini `summary`.
+        - When `status` is `failed`, includes the `error` object detailing the root cause (pages are preserved if parsing succeeded).
+        - When `status` is `queued` or `processing`, `pages` and `summary` are null.
+      tags:
+        - documents
+      parameters:
+        - $ref: '#/components/parameters/DocumentIdPathParam'
+      responses:
+        '200':
+          description: Document details retrieved successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentDetailResponse'
+              examples:
+                completedDocument:
+                  summary: Completed document with parsed markdown pages and Gemini summary
+                  value:
+                    document_id: "doc_01j9a8b7c6d5e4f3a2b1c0d9e8"
+                    filename: "annual_report_2026.pdf"
+                    parser: "gemini"
+                    status: "done"
+                    created_at: "2026-10-30T10:00:00Z"
+                    updated_at: "2026-10-30T10:02:15Z"
+                    pages:
+                      - page_number: 1
+                        content: "# Executive Summary\n\nFiscal year 2026 demonstrated sustained momentum across cloud and AI verticals."
+                        format: "markdown"
+                      - page_number: 2
+                        content: "## Financial Highlights\n\n- Gross Revenue: $120M (+18% YoY)\n- Operating Margin: 24%\n- Net Cash Flow: $42M"
+                        format: "markdown"
+                    summary: "The annual report presents an 18% YoY revenue increase to $120M with strong 24% operating margins supported by expanded enterprise subscription services."
+                    error: null
+                summarizingDocument:
+                  summary: Document with parsed pages currently generating Gemini summary
+                  value:
+                    document_id: "doc_01j9a8b7c6d5e4f3a2b1c0d9e8"
+                    filename: "annual_report_2026.pdf"
+                    parser: "gemini"
+                    status: "summarizing"
+                    created_at: "2026-10-30T10:00:00Z"
+                    updated_at: "2026-10-30T10:01:45Z"
+                    pages:
+                      - page_number: 1
+                        content: "# Executive Summary\n\nFiscal year 2026 demonstrated sustained momentum across cloud and AI verticals."
+                        format: "markdown"
+                    summary: null
+                    error: null
+                failedDocument:
+                  summary: Document that failed parsing due to encryption
+                  value:
+                    document_id: "doc_01j9a8b7c6d5e4f3a2b1c0d9fa"
+                    filename: "encrypted_statement.pdf"
+                    parser: "pypdf"
+                    status: "failed"
+                    created_at: "2026-10-30T10:10:00Z"
+                    updated_at: "2026-10-30T10:10:04Z"
+                    pages: null
+                    summary: null
+                    error:
+                      code: "ENCRYPTED_PDF"
+                      message: "The submitted PDF document is password-protected and cannot be read."
+                      details:
+                        encryption_type: "AES-256"
+                failedAfterParsing:
+                  summary: Document that parsed successfully but failed during summarization
+                  value:
+                    document_id: "doc_01j9a8b7c6d5e4f3a2b1c0d9fb"
+                    filename: "quarterly_results.pdf"
+                    parser: "pypdf"
+                    status: "failed"
+                    created_at: "2026-10-30T10:15:00Z"
+                    updated_at: "2026-10-30T10:16:30Z"
+                    pages:
+                      - page_number: 1
+                        content: "Q3 Results: Revenue grew 12% year over year."
+                        format: "text"
+                    summary: null
+                    error:
+                      code: "SUMMARY_RATE_LIMITED"
+                      message: "Summarization capacity temporarily exceeded after maximum retries."
+                      details:
+                        stage: "summarizing"
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntityError'
+        '429':
+          $ref: '#/components/responses/TooManyRequestsError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /documents/{document_id}/status:
+    get:
+      operationId: getDocumentStatus
+      summary: Lightweight status check for document progress polling
+      description: |
+        Lightweight endpoint designed for frequent client polling.
+        Returns the current document processing status without the overhead of serializing full page content and summary payloads.
+        Includes an optional HTTP `Retry-After` header suggesting when the client should poll next while the document is queued, processing, or summarizing.
+      tags:
+        - documents
+      parameters:
+        - $ref: '#/components/parameters/DocumentIdPathParam'
+      responses:
+        '200':
+          description: Current document status returned.
+          headers:
+            Retry-After:
+              $ref: '#/components/headers/RetryAfterHeader'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentStatusResponse'
+              examples:
+                inProgressStatus:
+                  summary: Document currently being parsed
+                  value:
+                    document_id: "doc_01j9a8b7c6d5e4f3a2b1c0d9e9"
+                    status: "processing"
+                    created_at: "2026-10-30T10:05:00Z"
+                    updated_at: "2026-10-30T10:05:12Z"
+                    error: null
+                summarizingStatus:
+                  summary: Document pages parsed, currently generating summary
+                  value:
+                    document_id: "doc_01j9a8b7c6d5e4f3a2b1c0d9e8"
+                    status: "summarizing"
+                    created_at: "2026-10-30T10:00:00Z"
+                    updated_at: "2026-10-30T10:01:45Z"
+                    error: null
+                completedStatus:
+                  summary: Document processing complete
+                  value:
+                    document_id: "doc_01j9a8b7c6d5e4f3a2b1c0d9e8"
+                    status: "done"
+                    created_at: "2026-10-30T10:00:00Z"
+                    updated_at: "2026-10-30T10:02:15Z"
+                    error: null
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntityError'
+        '429':
+          $ref: '#/components/responses/TooManyRequestsError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /health:
+    get:
+      operationId: getHealth
+      summary: Service health and dependency diagnostic check
+      description: |
+        Verifies operational health and liveness of the service, including downstream connectivity to Redis 7 Streams and LLM inference providers.
+      tags:
+        - system
+      responses:
+        '200':
+          description: Service is healthy and operational.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+              example:
+                status: "ok"
+                version: "1.0.0"
+                timestamp: "2026-10-30T10:15:00Z"
+                dependencies:
+                  redis: "healthy"
+                  gemini_api: "healthy"
+                  mistral_api: "healthy"
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntityError'
+        '429':
+          $ref: '#/components/responses/TooManyRequestsError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+components:
+  parameters:
+    DocumentIdPathParam:
+      name: document_id
+      in: path
+      required: true
+      description: Unique document identifier generated upon upload acceptance.
+      schema:
+        type: string
+        example: "doc_01j9a8b7c6d5e4f3a2b1c0d9e8"
+
+    LimitQueryParam:
+      name: limit
+      in: query
+      required: false
+      description: Number of document records to return per page.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+        example: 20
+
+    CursorQueryParam:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque pagination cursor token obtained from a previous list response.
+      schema:
+        type: string
+        example: "eyJjcmVhdGVkX2F0IjoiMjAyNi0xMC0zMFQxMDowNTowMFoifQ=="
+
+  headers:
+    RetryAfterHeader:
+      description: Recommended duration in seconds to wait before checking document status again.
+      schema:
+        type: integer
+        example: 3
+
+  schemas:
+    ErrorCode:
+      type: string
+      description: Machine-readable error code identifying the specific failure condition.
+      enum:
+        - INVALID_FILE_TYPE
+        - FILE_TOO_LARGE
+        - ENCRYPTED_PDF
+        - EMPTY_FILE
+        - TOO_MANY_FILES
+        - PARSER_UNAVAILABLE
+        - DOCUMENT_NOT_FOUND
+        - PARSER_FAILED
+        - SUMMARY_RATE_LIMITED
+        - SUMMARY_FAILED
+      example: INVALID_FILE_TYPE
+
+    Error:
+      type: object
+      description: Standardized error envelope used by all 4xx and 5xx responses.
+      required:
+        - code
+        - message
+      properties:
+        code:
+          $ref: '#/components/schemas/ErrorCode'
+        message:
+          type: string
+          description: Human-readable description of the error condition.
+          example: "Uploaded file is not a supported PDF document."
+        details:
+          description: Optional contextual information or field validation metadata.
+          example:
+            filename: "photo.jpg"
+            mime_detected: "image/jpeg"
+
+    ParserType:
+      type: string
+      description: |
+        Parser engine responsible for extracting document pages.
+        - `pypdf`: Extracts plain text (`format: text`).
+        - `gemini`: Multimodal LLM extraction yielding structured Markdown (`format: markdown`).
+        - `mistral`: Multimodal LLM extraction yielding structured Markdown (`format: markdown`).
+      enum:
+        - pypdf
+        - gemini
+        - mistral
+      default: pypdf
+      example: pypdf
+
+    DocumentStatus:
+      type: string
+      description: Processing lifecycle state of a document job.
+      enum:
+        - queued
+        - processing
+        - summarizing
+        - done
+        - failed
+      example: queued
+
+    ContentFormat:
+      type: string
+      description: Text format used for extracted page content.
+      enum:
+        - text
+        - markdown
+      example: markdown
+
+    DocumentUploadItem:
+      type: object
+      description: Enqueued document descriptor returned in response to batch upload.
+      required:
+        - document_id
+        - filename
+        - status
+      properties:
+        document_id:
+          type: string
+          description: Unique document identifier.
+          example: "doc_01j9a8b7c6d5e4f3a2b1c0d9e8"
+        filename:
+          type: string
+          description: Original file name provided during upload.
+          example: "annual_report_2026.pdf"
+        status:
+          $ref: '#/components/schemas/DocumentStatus'
+
+    DocumentListItem:
+      type: object
+      description: Summary metadata for a document in the paginated list view.
+      required:
+        - document_id
+        - filename
+        - parser
+        - status
+        - created_at
+        - updated_at
+      properties:
+        document_id:
+          type: string
+          description: Unique document identifier.
+          example: "doc_01j9a8b7c6d5e4f3a2b1c0d9e8"
+        filename:
+          type: string
+          description: Original filename.
+          example: "annual_report_2026.pdf"
+        parser:
+          $ref: '#/components/schemas/ParserType'
+        status:
+          $ref: '#/components/schemas/DocumentStatus'
+        created_at:
+          type: string
+          format: date-time
+          description: Timestamp when the document was received and enqueued.
+          example: "2026-10-30T10:00:00Z"
+        updated_at:
+          type: string
+          format: date-time
+          description: Timestamp of the latest status or content update.
+          example: "2026-10-30T10:02:15Z"
+
+    DocumentListResponse:
+      type: object
+      description: Paginated document list envelope.
+      required:
+        - items
+        - has_more
+      properties:
+        items:
+          type: array
+          description: Array of document summary items.
+          items:
+            $ref: '#/components/schemas/DocumentListItem'
+        next_cursor:
+          type:
+            - string
+            - "null"
+          description: Pagination cursor to supply in subsequent query, or null if no further pages exist.
+          example: "eyJjcmVhdGVkX2F0IjoiMjAyNi0xMC0zMFQxMDowNTowMFoifQ=="
+        has_more:
+          type: boolean
+          description: Flag indicating whether additional items are available past the current page.
+          example: true
+
+    DocumentPage:
+      type: object
+      description: Extracted page content from the source PDF.
+      required:
+        - page_number
+        - content
+        - format
+      properties:
+        page_number:
+          type: integer
+          minimum: 1
+          description: 1-indexed page sequence number in the source PDF.
+          example: 1
+        content:
+          type: string
+          description: Extracted content for this page (plain text or markdown).
+          example: "# Executive Summary\n\nFiscal year 2026 demonstrated sustained momentum."
+        format:
+          $ref: '#/components/schemas/ContentFormat'
+
+    DocumentDetailResponse:
+      type: object
+      description: Complete document details including parsed page contents and summary.
+      required:
+        - document_id
+        - filename
+        - parser
+        - status
+        - created_at
+        - updated_at
+      properties:
+        document_id:
+          type: string
+          description: Unique document identifier.
+          example: "doc_01j9a8b7c6d5e4f3a2b1c0d9e8"
+        filename:
+          type: string
+          description: Original filename.
+          example: "annual_report_2026.pdf"
+        parser:
+          $ref: '#/components/schemas/ParserType'
+        status:
+          $ref: '#/components/schemas/DocumentStatus'
+        created_at:
+          type: string
+          format: date-time
+          description: Timestamp when the document was received and enqueued.
+          example: "2026-10-30T10:00:00Z"
+        updated_at:
+          type: string
+          format: date-time
+          description: Timestamp of the latest status or result update.
+          example: "2026-10-30T10:02:15Z"
+        pages:
+          type:
+            - array
+            - "null"
+          description: Extracted page contents when status is 'summarizing', 'done', or 'failed' (after parsing succeeded), or null if parsing incomplete/failed.
+          items:
+            $ref: '#/components/schemas/DocumentPage'
+        summary:
+          type:
+            - string
+            - "null"
+          description: Single consolidated document summary generated by Gemini when status is 'done', or null while summarizing/failed.
+          example: "The annual report presents an 18% YoY revenue increase to $120M."
+        error:
+          anyOf:
+            - $ref: '#/components/schemas/Error'
+            - type: "null"
+          description: Error details if document processing failed.
+
+    DocumentStatusResponse:
+      type: object
+      description: Lightweight response object for polling document status.
+      required:
+        - document_id
+        - status
+        - created_at
+        - updated_at
+      properties:
+        document_id:
+          type: string
+          description: Unique document identifier.
+          example: "doc_01j9a8b7c6d5e4f3a2b1c0d9e8"
+        status:
+          $ref: '#/components/schemas/DocumentStatus'
+        created_at:
+          type: string
+          format: date-time
+          description: Timestamp when the document was received.
+          example: "2026-10-30T10:00:00Z"
+        updated_at:
+          type: string
+          format: date-time
+          description: Timestamp of the latest status transition.
+          example: "2026-10-30T10:02:15Z"
+        error:
+          anyOf:
+            - $ref: '#/components/schemas/Error'
+            - type: "null"
+          description: Error details if the status is 'failed'.
+
+    HealthResponse:
+      type: object
+      description: System health status and dependency diagnostic summary.
+      required:
+        - status
+        - version
+        - timestamp
+      properties:
+        status:
+          type: string
+          description: General operational status indicator.
+          enum:
+            - ok
+            - degraded
+            - unhealthy
+          example: "ok"
+        version:
+          type: string
+          description: Semantic application version.
+          example: "1.0.0"
+        timestamp:
+          type: string
+          format: date-time
+          description: Current server ISO-8601 timestamp.
+          example: "2026-10-30T10:15:00Z"
+        dependencies:
+          type: object
+          description: Health state of downstream components.
+          additionalProperties:
+            type: string
+          example:
+            redis: "healthy"
+            gemini_api: "healthy"
+            mistral_api: "healthy"
+
+  responses:
+    BadRequestError:
+      description: Bad Request - Client request payload or parameters are malformed.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            emptyFile:
+              summary: Uploaded file contains zero bytes
+              value:
+                code: "EMPTY_FILE"
+                message: "Uploaded file 'empty_doc.pdf' contains 0 bytes."
+                details:
+                  filename: "empty_doc.pdf"
+            encryptedPdf:
+              summary: PDF is encrypted and cannot be processed
+              value:
+                code: "ENCRYPTED_PDF"
+                message: "The submitted PDF document is encrypted and password-protected."
+                details:
+                  filename: "secure_statement.pdf"
+
+    NotFoundError:
+      description: Not Found - The requested document resource does not exist.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: "DOCUMENT_NOT_FOUND"
+            message: "Document with ID 'doc_01j9a8b7c6d5e4f3a2b1c0d9e8' was not found."
+            details:
+              document_id: "doc_01j9a8b7c6d5e4f3a2b1c0d9e8"
+
+    PayloadTooLargeError:
+      description: Payload Too Large - Request payload exceeds configured size or batch count limits.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            fileTooLarge:
+              summary: Single file exceeds 25MB limit
+              value:
+                code: "FILE_TOO_LARGE"
+                message: "File 'large_handbook.pdf' exceeds maximum allowable size of 25MB."
+                details:
+                  file_size_bytes: 31457280
+                  max_allowed_bytes: 26214400
+            tooManyFiles:
+              summary: Batch contains more than 10 files
+              value:
+                code: "TOO_MANY_FILES"
+                message: "Request contains 14 files; maximum batch size is 10 files."
+                details:
+                  file_count: 14
+                  max_allowed_files: 10
+
+    UnsupportedMediaTypeError:
+      description: Unsupported Media Type - File uploaded with unsupported MIME type.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: "INVALID_FILE_TYPE"
+            message: "Only 'application/pdf' files are accepted."
+            details:
+              received_content_type: "image/png"
+              expected_content_type: "application/pdf"
+
+    UnprocessableEntityError:
+      description: Unprocessable Entity - Semantic or schema validation failed on request parameters.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: "INVALID_FILE_TYPE"
+            message: "Validation failed: 'parser' must be one of: pypdf, gemini, mistral."
+            details:
+              field: "parser"
+              provided_value: "tesseract"
+              allowed_values:
+                - pypdf
+                - gemini
+                - mistral
+
+    TooManyRequestsError:
+      description: Too Many Requests - Client rate limits or upstream LLM quotas exceeded.
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfterHeader'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: "SUMMARY_RATE_LIMITED"
+            message: "Summarization capacity temporarily exceeded. Please retry after the duration indicated in Retry-After."
+            details:
+              retry_after_seconds: 60
+
+    InternalServerError:
+      description: Internal Server Error - Unexpected server error or downstream worker failure.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            parserUnavailable:
+              summary: Parser worker or LLM service unreachable
+              value:
+                code: "PARSER_UNAVAILABLE"
+                message: "The requested parser service is temporarily unreachable."
+                details:
+                  service: "gemini_parser"
+            parserFailed:
+              summary: Worker encountered fatal parsing crash
+              value:
+                code: "PARSER_FAILED"
+                message: "A fatal error occurred while executing the PDF parsing pipeline."
+                details:
+                  error_trace_id: "err_9876543210"

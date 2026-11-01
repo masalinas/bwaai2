@@ -1,0 +1,141 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: pdf_redis
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy noeviction
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 3s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: pdf_api
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - API_WORKERS=${API_WORKERS:-2}
+      - PDF_TTL_SECONDS=${PDF_TTL_SECONDS:-86400}
+      - MAX_FILE_SIZE_BYTES=${MAX_FILE_SIZE_BYTES:-26214400}
+      - MAX_FILES_PER_REQUEST=${MAX_FILES_PER_REQUEST:-10}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - MISTRAL_API_KEY=${MISTRAL_API_KEY:-}
+      - DEBUG=${DEBUG:-false}
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    stop_grace_period: 15s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.00"
+          memory: 1024M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: python -m app.worker
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - WORKER_CONCURRENCY=${WORKER_CONCURRENCY:-5}
+      - CLAIM_IDLE_MS=${CLAIM_IDLE_MS:-60000}
+      - MAX_ATTEMPTS=${MAX_ATTEMPTS:-3}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.5-flash}
+      - GEMINI_CONCURRENCY=${GEMINI_CONCURRENCY:-2}
+      - GEMINI_TIMEOUT_SECONDS=${GEMINI_TIMEOUT_SECONDS:-60}
+      - SUMMARY_MAX_INPUT_CHARS=${SUMMARY_MAX_INPUT_CHARS:-100000}
+      - MISTRAL_API_KEY=${MISTRAL_API_KEY:-}
+      - MISTRAL_OCR_MODEL=${MISTRAL_OCR_MODEL:-mistral-ocr-latest}
+      - MISTRAL_CONCURRENCY=${MISTRAL_CONCURRENCY:-2}
+      - MISTRAL_TIMEOUT_SECONDS=${MISTRAL_TIMEOUT_SECONDS:-60}
+      - MISTRAL_INLINE_THRESHOLD_BYTES=${MISTRAL_INLINE_THRESHOLD_BYTES:-10485760}
+      - DEBUG=${DEBUG:-false}
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import time, pathlib; p=pathlib.Path('/tmp/worker_heartbeat'); exit(0 if p.exists() and time.time()-p.stat().st_mtime < 30 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.00"
+          memory: 1024M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: pdf_frontend
+    ports:
+      - "${FRONTEND_PORT:-3000}:80"
+    environment:
+      - BACKEND_URL=http://api:8000
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+    name: pdf_redis_data
