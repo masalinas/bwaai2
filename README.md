@@ -198,6 +198,7 @@ The OpenSpec change api-contract and the authoritative OpenAPI 3.1 contract have
 * Redocly OpenAPI 3.1 Lint:
     ```bash
     npx -y @redocly/cli lint contracts/openapi.yaml
+    # Result: contracts/openapi.yaml: validated in 45ms. Woohoo! Your API description is valid. 🎉 (0 errors, 0 warnings) 
     ```
 ```
 
