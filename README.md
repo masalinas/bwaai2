@@ -1,4 +1,4 @@
-# Description
+# Description
 
 **PDF Processor** is an asynchronous document processing application. Users upload one or more PDF files through a web interface, choose a parsing method, and get back the content of each file page by page, plus one summary per file.
 
