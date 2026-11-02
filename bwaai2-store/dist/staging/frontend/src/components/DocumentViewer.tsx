@@ -210,7 +210,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
         {isSummarizing && (
           <div className="py-4 flex items-center gap-2.5 text-xs text-purple-700">
             <Loader2 className="w-4 h-4 animate-spin text-purple-600" />
-            <span>Generating executive summary with Gemini 2.5 Flash...</span>
+            <span>Generating executive summary with Gemini 3.8 Flash...</span>
           </div>
         )}
 

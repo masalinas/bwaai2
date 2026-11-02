@@ -1,6 +1,6 @@
 # Bwaai Async PDF Processor
 
-A resilient, production-grade asynchronous PDF processing engine and web application. Supports batch ingestion of PDF files, multi-engine page extraction (**PyPDF** plain text, **Gemini 2.5 Flash** multimodal markdown, and **Mistral OCR** markdown), automated executive summarization, and interactive tracking via a modern React single-page application.
+A resilient, production-grade asynchronous PDF processing engine and web application. Supports batch ingestion of PDF files, multi-engine page extraction (**PyPDF** plain text, **Gemini 3.8 Flash** multimodal markdown, and **Mistral OCR** markdown), automated executive summarization, and interactive tracking via a modern React single-page application.
 
 ---
 

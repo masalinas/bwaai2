@@ -58,7 +58,7 @@ The system previously accepted uploads and used PyPDF for plain-text extraction 
 | Environment Variable | Type | Default | Description |
 |---|---|---|---|
 | `GEMINI_API_KEY` | string | `""` | Google Gemini API key |
-| `GEMINI_MODEL` | string | `gemini-2.5-flash` | Gemini model identifier for parsing and summarization |
+| `GEMINI_MODEL` | string | `gemini-3.8-flash` | Gemini model identifier for parsing and summarization |
 | `GEMINI_CONCURRENCY` | integer | `2` | Max concurrent Gemini requests per worker instance |
 | `GEMINI_TIMEOUT_SECONDS` | integer | `60` | Request timeout for individual Gemini API calls |
 | `SUMMARY_MAX_INPUT_CHARS` | integer | `100000` | Character threshold for triggering map-reduce summarization |

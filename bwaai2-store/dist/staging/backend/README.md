@@ -6,7 +6,7 @@ FastAPI backend and asynchronous Redis Streams worker for PDF document ingestion
 
 - **API Service**: FastAPI application accepting batch uploads (`POST /documents`), validating files, saving binaries with TTL, enqueuing tasks to Redis Streams (`documents:jobs`), and providing query/status endpoints.
 - **Worker Daemon**: Asynchronous consumer group daemon (`documents:workers`) reading from `documents:jobs`, processing documents across a two-stage resumable pipeline:
-  1. **Stage 1 (Parsing)**: Extracts text using PyPDF (`pypdf`, plain text), Gemini 2.5 Flash (`gemini`, structured markdown), or Mistral OCR (`mistral`, structured markdown via OCR). Stores pages in Redis.
+  1. **Stage 1 (Parsing)**: Extracts text using PyPDF (`pypdf`, plain text), Gemini 3.8 Flash (`gemini`, structured markdown), or Mistral OCR (`mistral`, structured markdown via OCR). Stores pages in Redis.
   2. **Stage 2 (Summarization)**: Generates an executive summary using Gemini with single-pass or map-reduce chunking, preserving the document's language.
 - **Redis 7**: Shared in-memory data store for metadata hashes (`doc:{id}`), page results (`doc:{id}:pages`), summary text (`doc:{id}:summary`), binary files (`doc:{id}:file`), index sorted sets (`docs:index`), and task streams (`documents:jobs`, `documents:dead`).
 
@@ -18,7 +18,7 @@ FastAPI backend and asynchronous Redis Streams worker for PDF document ingestion
 |---|---|---|
 | `REDIS_URL` | `redis://localhost:6379/0` | Connection string for Redis 7 |
 | `GEMINI_API_KEY` | `""` | Google AI Studio Gemini API Key |
-| `GEMINI_MODEL` | `gemini-2.5-flash` | Gemini model name for multimodal parsing and summarization |
+| `GEMINI_MODEL` | `gemini-3.8-flash` | Gemini model name for multimodal parsing and summarization |
 | `GEMINI_CONCURRENCY` | `2` | Max concurrent Gemini API requests (protects 15 RPM free tier) |
 | `GEMINI_TIMEOUT_SECONDS`| `60` | Request timeout for Gemini API calls |
 | `MISTRAL_API_KEY` | `""` | Mistral AI API Key for OCR document processing |

@@ -16,7 +16,7 @@ export const AVAILABLE_PARSERS: ParserOption[] = [
   },
   {
     id: 'gemini',
-    name: 'Gemini 2.5 Flash',
+    name: 'Gemini 3.8 Flash',
     badge: 'Multimodal Markdown',
     description: 'High-fidelity multimodal markdown extraction & formatting',
   },

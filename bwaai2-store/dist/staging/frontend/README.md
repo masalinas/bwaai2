@@ -129,7 +129,7 @@ npm run gen:api
 2. **Open Frontend**:
    Navigate to [http://localhost:3000](http://localhost:3000).
 3. **Upload Document**:
-   Drag and drop `sample_doc.pdf` into the upload zone (or click "Choose files"), leave parser as `PyPDF` (or select `Gemini 2.5 Flash`), and click **Upload & Process (1)**.
+   Drag and drop `sample_doc.pdf` into the upload zone (or click "Choose files"), leave parser as `PyPDF` (or select `Gemini 3.8 Flash`), and click **Upload & Process (1)**.
 4. **Observe Real-Time Lifecycle**:
    - The document immediately appears at the top of the list in **Queued** state.
    - TanStack Query automatically polls the status: badge transitions to **Processing** -> **Summarizing** -> **Done**.

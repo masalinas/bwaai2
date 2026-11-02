@@ -10,7 +10,7 @@
 2. **Queue**: each file becomes a job in a **Redis Streams** queue, so uploads never block on parsing.
 3. **Processing**: one or more workers, running as a consumer group, pick up the jobs and extract the content:
    - **PyPDF**: fast, plain-text extraction.
-   - **Google Gemini** (`gemini-2.5-flash`): converts the PDF to markdown.
+   - **Google Gemini** (`gemini-3.8-flash`): converts the PDF to markdown.
    - **Mistral OCR**: converts the PDF to markdown, useful for scanned documents.
 4. **Summarization**: Gemini generates one summary per document, whichever parser was used.
 5. **Results**: the frontend polls the API and shows the status of each document (`queued` → `processing` → `summarizing` → `done` | `failed`), the per-page content and the summary as soon as they are available.
@@ -465,7 +465,7 @@ Out of scope: Mistral (keeps returning `PARSER_UNAVAILABLE`), frontend.
 
 B. BACKEND (bwaai2-backend)
 1. Gemini client service `app/services/gemini.py`:
-   - Official `google-genai` SDK, async API. Model id from env `GEMINI_MODEL` (default `gemini-2.5-flash`), key from `GEMINI_API_KEY`. Never log the key. Never hard-code it; add it to `.env.example` and to the `worker` service in docker-compose.yml.
+   - Official `google-genai` SDK, async API. Model id from env `GEMINI_MODEL` (default `gemini-3.8-flash`), key from `GEMINI_API_KEY`. Never log the key. Never hard-code it; add it to `.env.example` and to the `worker` service in docker-compose.yml.
    - Single wrapper with timeout, and error classification: 429/quota -> `SUMMARY_RATE_LIMITED` (transient), 5xx/timeouts -> transient, 4xx invalid request/blocked content -> permanent.
    - Limit concurrent Gemini calls with a semaphore (env `GEMINI_CONCURRENCY`, default 2) to stay inside the free tier. Exponential backoff with jitter honoring `Retry-After`/retry delay when present.
 2. Gemini parser `GeminiParser` implementing the existing `Parser` interface:

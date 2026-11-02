@@ -178,7 +178,7 @@ Parser selection is driven by configuration constants in `src/config/parsers.ts`
 ```ts
 export const AVAILABLE_PARSERS: { id: ParserType; name: string; description: string }[] = [
   { id: 'pypdf', name: 'PyPDF', description: 'Fast plain-text extraction' },
-  { id: 'gemini', name: 'Gemini 2.5 Flash', description: 'Multimodal markdown extraction' },
+  { id: 'gemini', name: 'Gemini 3.8 Flash', description: 'Multimodal markdown extraction' },
   { id: 'mistral', name: 'Mistral OCR', description: 'Document OCR (Coming soon)' },
 ];
 

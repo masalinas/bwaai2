@@ -1,7 +1,7 @@
 # pdf-processor Specification
 
 ## Purpose
-Comprehensive specification for the asynchronous PDF processing system (BWAAI2), covering OpenAPI 3.1 contract definitions, FastAPI document ingestion and cursor-paginated queries, Redis Streams worker queue orchestration, multi-engine parsers (PyPDF, Google Gemini 2.5 Flash, Mistral OCR), resumable two-stage pipelines, dead-letter failure recovery, React single-page frontend application, and containerized Docker Compose packaging.
+Comprehensive specification for the asynchronous PDF processing system (BWAAI2), covering OpenAPI 3.1 contract definitions, FastAPI document ingestion and cursor-paginated queries, Redis Streams worker queue orchestration, multi-engine parsers (PyPDF, Google Gemini 3.8 Flash, Mistral OCR), resumable two-stage pipelines, dead-letter failure recovery, React single-page frontend application, and containerized Docker Compose packaging.
 
 ## Requirements
 

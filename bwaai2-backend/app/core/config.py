@@ -30,7 +30,7 @@ class Settings(BaseSettings):
 
     # Gemini & Summarization Configuration
     GEMINI_API_KEY: str = ""
-    GEMINI_MODEL: str = "gemini-2.5-flash"
+    GEMINI_MODEL: str = "gemini-3.8-flash"
     GEMINI_CONCURRENCY: int = 2
     GEMINI_TIMEOUT_SECONDS: int = 60
     SUMMARY_MAX_INPUT_CHARS: int = 100_000
