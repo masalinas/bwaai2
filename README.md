@@ -2,7 +2,7 @@
 
 **PDF Processor** is an asynchronous document processing application. Users upload one or more PDF files through a web interface, choose a parsing method, and get back the content of each file page by page, plus one summary per file.
 
-![BWAAI2 pyPDF Frontend](/images/bwaaia_pypdf_frontend.png "BWAAI2 pyPDF Frontend")
+![BWAAI2 pyPDF Frontend](/images/bwaai2_pypdf_frontend.png "BWAAI2 pyPDF Frontend")
 
 ### How it works
 
@@ -102,7 +102,7 @@ The **OpenSpec store**. It holds no application code, only the specifications th
 - `images/`: BWAAI2 Test Task images.
 - `contracts/openapi.yaml`: the OpenAPI contract, the single source of truth between backend and frontend.
 - `openspec/changes/`: one folder per change, each with `proposal.md`, `design.md`, `specs/` and `tasks.md`. Changes were implemented in order: `api-contract`, `backend-pypdf-upload`, `redis-streams-worker`, `gemini-summary-and-parsing`, `mistral-ocr`, `frontend-react` and `docker-compose-hardening`.
-- `delivery/`: assets used to package the final deliverable (root `docker-compose.yml`, scripts, samples and the main README). 
+- `delivery/`: assets used to package the final deliverable (root `docker-compose.yml`, scripts, samples and the main README).
 - `dist/`: is the generated output folder of the packaging step (make package), holding the delivery copy (staging/) and the final zip, and it can be safely deleted and rebuilt at any time.
 
 ### `bwaai2-backend`: API and workers
@@ -204,7 +204,7 @@ The OpenSpec change api-contract and the authoritative OpenAPI 3.1 contract have
 * Redocly OpenAPI 3.1 Lint:
     ```bash
     npx -y @redocly/cli lint contracts/openapi.yaml
-    # Result: contracts/openapi.yaml: validated in 45ms. Woohoo! Your API description is valid. 🎉 (0 errors, 0 warnings) 
+    # Result: contracts/openapi.yaml: validated in 45ms. Woohoo! Your API description is valid. 🎉 (0 errors, 0 warnings)
     ```
 ```
 
@@ -546,7 +546,7 @@ The OpenSpec change `gemini-summary-and-parsing` has been fully implemented and 
 * Linting and formatting checks (`ruff check .`, `ruff format --check .`) passed cleanly with 0 errors.
 ```
 
-## Change 05: frontend-react 
+## Change 05: frontend-react
 
 ```shell
 Create and implement the OpenSpec change `frontend-react`.
