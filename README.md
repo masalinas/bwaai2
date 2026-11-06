@@ -834,7 +834,9 @@ The OpenSpec change `docker-compose-hardening` has been implemented, validated, 
 
 2. Backend Hardening (`bwaai2-backend`):
     * Contract Path Resolution: `resolve_contract_path()` resolves `CONTRACT_PATH` env var -> `../contracts/openapi.yaml` (zip layout) -> `../bwaai2-store/contracts/openapi.yaml` (dev layout), verified by `test_contract_path_resolution`.
-    * Worker Heartbeat: `heartbeat_loop` maintains `/tmp/worker_heartbeat` for fast container health probes without network overhead.
+    * Worker Heartbeat & Liveness: `heartbeat_loop` maintains `/tmp/worker_heartbeat` for fast container health probes without network overhead.
+    * Distributed Lock Lease Renewal: In `JobProcessor`, workers acquire `doc:lock:{doc_id}` (`NX EX 30`) and maintain a background renewal loop resetting PEL idle time via `XCLAIM ... JUSTID` every 10s, preventing duplicate processing on long-running AI calls.
+    * Crash & Poison-Pill DLQ Guard: Pre-execution guard in `process_message` checks `delivery_count > MAX_ATTEMPTS`, routing repeatedly crashed jobs directly to DLQ `documents:dead` and acknowledging via `XACK` to prevent infinite retry loops.
     * Missing Key Resilience: `GeminiParser.parse` and `DocumentSummarizer.summarize_document` report clear domain errors (`PARSER_UNAVAILABLE`, `SUMMARY_FAILED`) without crashing when API keys are empty.
     * Container Hardening: Multi-stage Dockerfile with dedicated non-root user `appuser` (UID 1000), pinned Python 3.12.9 base image, configurable `API_WORKERS`, and strict `.dockerignore`.
 

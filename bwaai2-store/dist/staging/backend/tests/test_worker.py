@@ -621,3 +621,245 @@ async def test_two_workers_parallel_consumption(client: AsyncClient, fake_redis)
     for doc_id in doc_ids:
         meta = await fake_redis.hgetall(constants.doc_key(doc_id))
         assert meta[b"status"] == b"done"
+
+
+@pytest.mark.asyncio
+async def test_worker_repeated_crashes_route_to_dlq(fake_redis) -> None:
+    """Test that 3 successive worker crashes cause the 4th delivery to immediately route to DLQ."""
+    consumer = StreamConsumer(redis=fake_redis, consumer_name="worker-crash-test")
+    await consumer.init_group()
+
+    doc_id = "doc_poison_pill"
+    pdf_bytes = create_sample_pdf(1)
+    now_iso = datetime.now(UTC).isoformat()
+
+    await fake_redis.set(constants.doc_file_key(doc_id), pdf_bytes)
+    await fake_redis.hset(
+        constants.doc_key(doc_id),
+        mapping={
+            b"document_id": doc_id.encode("utf-8"),
+            b"filename": b"poison.pdf",
+            b"parser": b"pypdf",
+            b"status": b"queued",
+            b"created_at": now_iso.encode("utf-8"),
+            b"updated_at": now_iso.encode("utf-8"),
+            b"error": b"",
+        },
+    )
+    msg_id = await fake_redis.xadd(
+        constants.STREAM_DOCUMENTS_JOBS,
+        {b"document_id": doc_id.encode("utf-8"), b"parser": b"pypdf"},
+    )
+    msg_id_str = msg_id.decode("utf-8") if isinstance(msg_id, bytes) else str(msg_id)
+
+    # 1st attempt: worker 1 reads message from stream, then crashes abruptly
+    await fake_redis.xreadgroup(
+        groupname=constants.GROUP_DOCUMENTS_WORKERS,
+        consumername="crashed-worker-1",
+        streams={constants.STREAM_DOCUMENTS_JOBS: ">"},
+        count=1,
+    )
+    p = await fake_redis.xpending_range(
+        constants.STREAM_DOCUMENTS_JOBS,
+        constants.GROUP_DOCUMENTS_WORKERS,
+        min=msg_id_str,
+        max=msg_id_str,
+        count=1,
+    )
+    assert p[0]["times_delivered"] == 1
+
+    # 2nd attempt: worker 2 autoclaims message, then crashes abruptly
+    await fake_redis.xautoclaim(
+        name=constants.STREAM_DOCUMENTS_JOBS,
+        groupname=constants.GROUP_DOCUMENTS_WORKERS,
+        consumername="crashed-worker-2",
+        min_idle_time=0,
+        start_id="0-0",
+        count=1,
+    )
+    p = await fake_redis.xpending_range(
+        constants.STREAM_DOCUMENTS_JOBS,
+        constants.GROUP_DOCUMENTS_WORKERS,
+        min=msg_id_str,
+        max=msg_id_str,
+        count=1,
+    )
+    assert p[0]["times_delivered"] == 2
+
+    # 3rd attempt: worker 3 autoclaims message, then crashes abruptly
+    await fake_redis.xautoclaim(
+        name=constants.STREAM_DOCUMENTS_JOBS,
+        groupname=constants.GROUP_DOCUMENTS_WORKERS,
+        consumername="crashed-worker-3",
+        min_idle_time=0,
+        start_id="0-0",
+        count=1,
+    )
+    p = await fake_redis.xpending_range(
+        constants.STREAM_DOCUMENTS_JOBS,
+        constants.GROUP_DOCUMENTS_WORKERS,
+        min=msg_id_str,
+        max=msg_id_str,
+        count=1,
+    )
+    assert p[0]["times_delivered"] == 3
+
+    # 4th attempt: live worker autoclaims and processes with delivery_count > MAX_ATTEMPTS (3)
+    live_consumer = StreamConsumer(redis=fake_redis, consumer_name="live-worker")
+    autoclaimer = AutoClaimer(
+        redis=fake_redis,
+        consumer_name="live-worker",
+        processor=live_consumer.processor,
+        semaphore=live_consumer.semaphore,
+    )
+
+    mock_parse = AsyncMock()
+    with patch.object(live_consumer.processor.pypdf_parser, "parse", mock_parse):
+        with patch.object(settings, "CLAIM_IDLE_MS", 0):
+            claimed = await autoclaimer.sweep_once()
+            assert claimed == 1
+
+        # Give async task time to run
+        await asyncio.sleep(0.05)
+
+        # Verify parser was NEVER called on the 4th attempt
+        mock_parse.assert_not_called()
+
+        # Verify document status is failed with PARSER_FAILED
+        meta = await fake_redis.hgetall(constants.doc_key(doc_id))
+        assert meta[b"status"] == b"failed"
+        error_data = meta[b"error"].decode("utf-8")
+        assert "PARSER_FAILED" in error_data
+        assert "3 attempts" in error_data
+
+        # Verify DLQ received the poison pill message
+        dlq_entries = await fake_redis.xrange(constants.STREAM_DOCUMENTS_DEAD)
+        assert len(dlq_entries) == 1
+        dlq_fields = dlq_entries[0][1]
+        assert dlq_fields[b"document_id"] == doc_id.encode("utf-8")
+        assert dlq_fields[b"error_code"] == b"PARSER_FAILED"
+        assert dlq_fields[b"attempts"] == b"4"
+
+        # Verify message was acknowledged in the jobs stream
+        pending_after = await fake_redis.xpending_range(
+            constants.STREAM_DOCUMENTS_JOBS,
+            constants.GROUP_DOCUMENTS_WORKERS,
+            min=msg_id_str,
+            max=msg_id_str,
+            count=1,
+        )
+        assert len(pending_after) == 0
+
+
+@pytest.mark.asyncio
+async def test_worker_long_running_job_lease_prevents_duplicate_processing(fake_redis) -> None:
+    """Test that distributed locking and lease renewal prevent a secondary worker from duplicating a slow job."""
+    consumer_1 = StreamConsumer(redis=fake_redis, consumer_name="worker-1")
+    await consumer_1.init_group()
+
+    doc_id = "doc_slow_processing"
+    pdf_bytes = create_sample_pdf(1)
+    now_iso = datetime.now(UTC).isoformat()
+
+    await fake_redis.set(constants.doc_file_key(doc_id), pdf_bytes)
+    await fake_redis.hset(
+        constants.doc_key(doc_id),
+        mapping={
+            b"document_id": doc_id.encode("utf-8"),
+            b"filename": b"slow.pdf",
+            b"parser": b"pypdf",
+            b"status": b"queued",
+            b"created_at": now_iso.encode("utf-8"),
+            b"updated_at": now_iso.encode("utf-8"),
+            b"error": b"",
+        },
+    )
+    msg_id = await fake_redis.xadd(
+        constants.STREAM_DOCUMENTS_JOBS,
+        {b"document_id": doc_id.encode("utf-8"), b"parser": b"pypdf"},
+    )
+    msg_id_str = msg_id.decode("utf-8") if isinstance(msg_id, bytes) else str(msg_id)
+
+    worker_1_started = asyncio.Event()
+    worker_1_can_finish = asyncio.Event()
+    parse_call_count = 0
+
+    async def slow_parse(raw_bytes: bytes) -> list[DocumentPage]:
+        nonlocal parse_call_count
+        parse_call_count += 1
+        worker_1_started.set()
+        await worker_1_can_finish.wait()
+        return [DocumentPage(page_number=1, content="Parsed text", format=ContentFormat.text)]
+
+    consumer_2 = StreamConsumer(redis=fake_redis, consumer_name="worker-2")
+    autoclaimer_2 = AutoClaimer(
+        redis=fake_redis,
+        consumer_name="worker-2",
+        processor=consumer_2.processor,
+        semaphore=consumer_2.semaphore,
+    )
+
+    with (
+        patch.object(consumer_1.processor.pypdf_parser, "parse", side_effect=slow_parse),
+        patch.object(
+            DocumentSummarizer,
+            "summarize_document",
+            new_callable=AsyncMock,
+            return_value="Summary of slow doc",
+        ),
+    ):
+        # Worker 1 reads the message from stream into its PEL
+        res = await fake_redis.xreadgroup(
+            groupname=constants.GROUP_DOCUMENTS_WORKERS,
+            consumername="worker-1",
+            streams={constants.STREAM_DOCUMENTS_JOBS: ">"},
+            count=1,
+        )
+        assert len(res[0][1]) == 1
+
+        # Worker 1 starts processing
+        task_1 = asyncio.create_task(
+            consumer_1.processor.process_message(
+                msg_id=msg_id_str,
+                fields={"document_id": doc_id, "parser": "pypdf"},
+                consumer_name="worker-1",
+                delivery_count=1,
+            )
+        )
+
+        # Wait until Worker 1 is actively inside slow_parse
+        await worker_1_started.wait()
+
+        # Verify Worker 1 actively holds the distributed lock
+        lock_val = await fake_redis.get(constants.doc_lock_key(doc_id))
+        assert lock_val == b"worker-1"
+
+        # Worker 2 sweeps via AutoClaimer (with CLAIM_IDLE_MS = 0)
+        with patch.object(settings, "CLAIM_IDLE_MS", 0):
+            # AutoClaimer claims the message in PEL, but skips dispatching because lock is held
+            claimed = await autoclaimer_2.sweep_once()
+            assert claimed == 1
+
+        # Also test direct process_message attempt by Worker 2: it should abort because lock is held
+        await consumer_2.processor.process_message(
+            msg_id=msg_id_str,
+            fields={"document_id": doc_id, "parser": "pypdf"},
+            consumer_name="worker-2",
+            delivery_count=2,
+        )
+
+        # Worker 2 did NOT call parser
+        assert parse_call_count == 1
+
+        # Release Worker 1 to complete processing
+        worker_1_can_finish.set()
+        await task_1
+
+        # Verify pipeline succeeded
+        meta = await fake_redis.hgetall(constants.doc_key(doc_id))
+        assert meta[b"status"] == b"done"
+        assert parse_call_count == 1
+
+        # Lock was safely released in finally block
+        lock_after = await fake_redis.exists(constants.doc_lock_key(doc_id))
+        assert lock_after == 0
