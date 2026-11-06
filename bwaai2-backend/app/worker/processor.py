@@ -1,3 +1,4 @@
+import asyncio
 import json
 from datetime import UTC, datetime
 
@@ -112,6 +113,26 @@ class JobProcessor:
             )
             return
 
+        # Pre-execution crash and DLQ guard check:
+        if delivery_count > settings.MAX_ATTEMPTS:
+            logger.error(
+                "[%s] [%s] Delivery count (%d) exceeded MAX_ATTEMPTS (%d). Routing to DLQ.",
+                consumer_name,
+                doc_id,
+                delivery_count,
+                settings.MAX_ATTEMPTS,
+            )
+            await self._handle_permanent_error(
+                doc_id=doc_id,
+                parser=parser_name,
+                msg_id=msg_id,
+                code=ErrorCode.PARSER_FAILED,
+                message=f"Job crashed or failed to complete after {delivery_count - 1} attempts.",
+                consumer_name=consumer_name,
+                attempts=delivery_count,
+            )
+            return
+
         parser = self._get_parser_for(parser_name)
         if not parser:
             await self._handle_permanent_error(
@@ -125,115 +146,277 @@ class JobProcessor:
             )
             return
 
-        # -------------------------------------------------------------
-        # STAGE 1: PARSING (Resumable)
-        # -------------------------------------------------------------
-        pages_raw = await self.redis.get(constants.doc_pages_key(doc_id))
-        pages: list[DocumentPage]
-
-        if pages_raw:
-            logger.info(
-                "[%s] [%s] Pages already parsed in Redis; skipping Stage 1", consumer_name, doc_id
+        # Acquire distributed lock before processing
+        lock_key = constants.doc_lock_key(doc_id)
+        lock_acquired = await self.redis.set(lock_key, consumer_name, nx=True, ex=30)
+        if not lock_acquired:
+            logger.warning(
+                "[%s] [%s] Document is actively held by another worker; skipping duplicate execution.",
+                consumer_name,
+                doc_id,
             )
-            pages_data = json.loads(pages_raw.decode("utf-8"))
-            pages = [DocumentPage(**p) for p in pages_data]
-        else:
-            # Mark processing
+            return
+
+        heartbeat_stop = asyncio.Event()
+
+        async def _heartbeat_loop() -> None:
+            renewal_interval = min(10, max(1, settings.AUTOCLAIM_INTERVAL_SECONDS))
+            try:
+                while not heartbeat_stop.is_set():
+                    try:
+                        await asyncio.wait_for(heartbeat_stop.wait(), timeout=renewal_interval)
+                        break
+                    except TimeoutError:
+                        pass
+                    # Renew lock TTL
+                    try:
+                        val = await self.redis.get(lock_key)
+                        val_str = (
+                            val.decode("utf-8")
+                            if isinstance(val, bytes)
+                            else str(val)
+                            if val
+                            else None
+                        )
+                        if val_str == consumer_name:
+                            await self.redis.expire(lock_key, 30)
+                    except Exception as e:
+                        logger.warning(
+                            "[%s] [%s] Failed to renew lock: %s", consumer_name, doc_id, e
+                        )
+                    # Reset stream message idle time in PEL so XAUTOCLAIM does not reclaim active job
+                    try:
+                        await self.redis.xclaim(
+                            constants.STREAM_DOCUMENTS_JOBS,
+                            constants.GROUP_DOCUMENTS_WORKERS,
+                            consumer_name,
+                            min_idle_time=0,
+                            message_ids=[msg_id],
+                            justid=True,
+                        )
+                    except Exception as e:
+                        logger.debug(
+                            "[%s] [%s] Could not reset PEL idle time: %s", consumer_name, doc_id, e
+                        )
+            except asyncio.CancelledError:
+                pass
+
+        heartbeat_task = asyncio.create_task(_heartbeat_loop())
+
+        try:
+            # -------------------------------------------------------------
+            # STAGE 1: PARSING (Resumable)
+            # -------------------------------------------------------------
+            pages_raw = await self.redis.get(constants.doc_pages_key(doc_id))
+            pages: list[DocumentPage]
+
+            if pages_raw:
+                logger.info(
+                    "[%s] [%s] Pages already parsed in Redis; skipping Stage 1",
+                    consumer_name,
+                    doc_id,
+                )
+                pages_data = json.loads(pages_raw.decode("utf-8"))
+                pages = [DocumentPage(**p) for p in pages_data]
+            else:
+                # Mark processing
+                now_iso = datetime.now(UTC).isoformat()
+                await self.redis.hset(
+                    constants.doc_key(doc_id),
+                    mapping={
+                        b"status": b"processing",
+                        b"started_at": now_iso.encode("utf-8"),
+                        b"updated_at": now_iso.encode("utf-8"),
+                    },
+                )
+
+                # Load raw PDF bytes
+                pdf_bytes = await self.redis.get(constants.doc_file_key(doc_id))
+                if not pdf_bytes:
+                    logger.error(
+                        "[%s] [%s] PDF bytes missing or expired from Redis", consumer_name, doc_id
+                    )
+                    await self._handle_permanent_error(
+                        doc_id=doc_id,
+                        parser=parser_name,
+                        msg_id=msg_id,
+                        code=ErrorCode.DOCUMENT_NOT_FOUND,
+                        message="PDF file bytes have expired or were not found.",
+                        consumer_name=consumer_name,
+                        attempts=delivery_count,
+                    )
+                    return
+
+                try:
+                    pages = await parser.parse(pdf_bytes)
+                    pages_json = json.dumps([p.model_dump() for p in pages])
+                    # Store pages in Redis
+                    await self.redis.set(
+                        constants.doc_pages_key(doc_id), pages_json.encode("utf-8")
+                    )
+                    logger.info(
+                        "[%s] [%s] Stage 1 (Parsing) completed: %d pages saved",
+                        consumer_name,
+                        doc_id,
+                        len(pages),
+                    )
+                except EncryptedPDFError as ex:
+                    await self._handle_permanent_error(
+                        doc_id,
+                        parser_name,
+                        msg_id,
+                        ErrorCode.ENCRYPTED_PDF,
+                        ex.message,
+                        consumer_name,
+                        delivery_count,
+                    )
+                    return
+                except InvalidFileTypeError as ex:
+                    await self._handle_permanent_error(
+                        doc_id,
+                        parser_name,
+                        msg_id,
+                        ErrorCode.INVALID_FILE_TYPE,
+                        ex.message,
+                        consumer_name,
+                        delivery_count,
+                    )
+                    return
+                except ParserUnavailableError as ex:
+                    await self._handle_permanent_error(
+                        doc_id,
+                        parser_name,
+                        msg_id,
+                        ErrorCode.PARSER_UNAVAILABLE,
+                        ex.message,
+                        consumer_name,
+                        delivery_count,
+                    )
+                    return
+                except (ParserRateLimitedError, ParserTransientError) as ex:
+                    await self._handle_transient_error(
+                        doc_id, parser_name, msg_id, ex.message, consumer_name, delivery_count
+                    )
+                    return
+                except ParserFailedError as ex:
+                    await self._handle_permanent_error(
+                        doc_id,
+                        parser_name,
+                        msg_id,
+                        ErrorCode.PARSER_FAILED,
+                        ex.message,
+                        consumer_name,
+                        delivery_count,
+                    )
+                    return
+                except (ConnectionError, TimeoutError, RedisError) as ex:
+                    await self._handle_transient_error(
+                        doc_id, parser_name, msg_id, str(ex), consumer_name, delivery_count
+                    )
+                    return
+                except Exception as ex:
+                    logger.error(
+                        "[%s] [%s] Unexpected error during parsing: %s",
+                        consumer_name,
+                        doc_id,
+                        ex,
+                        exc_info=True,
+                    )
+                    if delivery_count >= settings.MAX_ATTEMPTS:
+                        await self._handle_permanent_error(
+                            doc_id,
+                            parser_name,
+                            msg_id,
+                            ErrorCode.PARSER_FAILED,
+                            f"Parsing crashed: {str(ex)}",
+                            consumer_name,
+                            delivery_count,
+                        )
+                    else:
+                        await self._handle_transient_error(
+                            doc_id, parser_name, msg_id, str(ex), consumer_name, delivery_count
+                        )
+                    return
+
+            # -------------------------------------------------------------
+            # STAGE TRANSITION: SUMMARIZING
+            # -------------------------------------------------------------
             now_iso = datetime.now(UTC).isoformat()
             await self.redis.hset(
                 constants.doc_key(doc_id),
                 mapping={
-                    b"status": b"processing",
-                    b"started_at": now_iso.encode("utf-8"),
+                    b"status": b"summarizing",
                     b"updated_at": now_iso.encode("utf-8"),
                 },
             )
+            logger.info("[%s] [%s] Transitioned to summarizing stage", consumer_name, doc_id)
 
-            # Load raw PDF bytes
-            pdf_bytes = await self.redis.get(constants.doc_file_key(doc_id))
-            if not pdf_bytes:
-                logger.error(
-                    "[%s] [%s] PDF bytes missing or expired from Redis", consumer_name, doc_id
-                )
-                await self._handle_permanent_error(
-                    doc_id=doc_id,
-                    parser=parser_name,
-                    msg_id=msg_id,
-                    code=ErrorCode.DOCUMENT_NOT_FOUND,
-                    message="PDF file bytes have expired or were not found.",
-                    consumer_name=consumer_name,
-                    attempts=delivery_count,
-                )
-                return
-
+            # -------------------------------------------------------------
+            # STAGE 2: SUMMARIZATION
+            # -------------------------------------------------------------
             try:
-                pages = await parser.parse(pdf_bytes)
-                pages_json = json.dumps([p.model_dump() for p in pages])
-                # Store pages in Redis
-                await self.redis.set(constants.doc_pages_key(doc_id), pages_json.encode("utf-8"))
+                summary = await self.summarizer.summarize_document(pages)
+                finish_iso = datetime.now(UTC).isoformat()
+
+                # Atomically save summary and transition to done
+                pipe = self.redis.pipeline(transaction=True)
+                pipe.set(constants.doc_summary_key(doc_id), summary.encode("utf-8"))
+                pipe.hset(
+                    constants.doc_key(doc_id),
+                    mapping={
+                        b"status": b"done",
+                        b"finished_at": finish_iso.encode("utf-8"),
+                        b"updated_at": finish_iso.encode("utf-8"),
+                    },
+                )
+                await pipe.execute()
+
+                # Acknowledge strictly AFTER both stages succeed
+                await self.redis.xack(
+                    constants.STREAM_DOCUMENTS_JOBS, constants.GROUP_DOCUMENTS_WORKERS, msg_id
+                )
                 logger.info(
-                    "[%s] [%s] Stage 1 (Parsing) completed: %d pages saved",
+                    "[%s] [%s] [attempt_%d] Pipeline complete: status done with summary (%d chars)",
                     consumer_name,
                     doc_id,
-                    len(pages),
+                    delivery_count,
+                    len(summary),
                 )
-            except EncryptedPDFError as ex:
+
+            except SummaryFailedError as ex:
+                # Permanent summarization failure (e.g. empty text, prompt blocked)
                 await self._handle_permanent_error(
                     doc_id,
                     parser_name,
                     msg_id,
-                    ErrorCode.ENCRYPTED_PDF,
+                    ErrorCode.SUMMARY_FAILED,
                     ex.message,
                     consumer_name,
                     delivery_count,
                 )
-                return
-            except InvalidFileTypeError as ex:
-                await self._handle_permanent_error(
-                    doc_id,
-                    parser_name,
-                    msg_id,
-                    ErrorCode.INVALID_FILE_TYPE,
-                    ex.message,
-                    consumer_name,
-                    delivery_count,
-                )
-                return
-            except ParserUnavailableError as ex:
-                await self._handle_permanent_error(
-                    doc_id,
-                    parser_name,
-                    msg_id,
-                    ErrorCode.PARSER_UNAVAILABLE,
-                    ex.message,
-                    consumer_name,
-                    delivery_count,
-                )
-                return
-            except (ParserRateLimitedError, ParserTransientError) as ex:
-                await self._handle_transient_error(
-                    doc_id, parser_name, msg_id, ex.message, consumer_name, delivery_count
-                )
-                return
-            except ParserFailedError as ex:
-                await self._handle_permanent_error(
-                    doc_id,
-                    parser_name,
-                    msg_id,
-                    ErrorCode.PARSER_FAILED,
-                    ex.message,
-                    consumer_name,
-                    delivery_count,
-                )
-                return
+            except SummaryRateLimitedError as ex:
+                # Rate limit is transient: retry up to MAX_ATTEMPTS
+                if delivery_count >= settings.MAX_ATTEMPTS:
+                    await self._handle_permanent_error(
+                        doc_id,
+                        parser_name,
+                        msg_id,
+                        ErrorCode.SUMMARY_RATE_LIMITED,
+                        ex.message,
+                        consumer_name,
+                        delivery_count,
+                    )
+                else:
+                    await self._handle_transient_error(
+                        doc_id, parser_name, msg_id, ex.message, consumer_name, delivery_count
+                    )
             except (ConnectionError, TimeoutError, RedisError) as ex:
                 await self._handle_transient_error(
                     doc_id, parser_name, msg_id, str(ex), consumer_name, delivery_count
                 )
-                return
             except Exception as ex:
                 logger.error(
-                    "[%s] [%s] Unexpected error during parsing: %s",
+                    "[%s] [%s] Unexpected error during summarization: %s",
                     consumer_name,
                     doc_id,
                     ex,
@@ -244,8 +427,8 @@ class JobProcessor:
                         doc_id,
                         parser_name,
                         msg_id,
-                        ErrorCode.PARSER_FAILED,
-                        f"Parsing crashed: {str(ex)}",
+                        ErrorCode.SUMMARY_FAILED,
+                        f"Summarization failed: {str(ex)}",
                         consumer_name,
                         delivery_count,
                     )
@@ -253,106 +436,23 @@ class JobProcessor:
                     await self._handle_transient_error(
                         doc_id, parser_name, msg_id, str(ex), consumer_name, delivery_count
                     )
-                return
-
-        # -------------------------------------------------------------
-        # STAGE TRANSITION: SUMMARIZING
-        # -------------------------------------------------------------
-        now_iso = datetime.now(UTC).isoformat()
-        await self.redis.hset(
-            constants.doc_key(doc_id),
-            mapping={
-                b"status": b"summarizing",
-                b"updated_at": now_iso.encode("utf-8"),
-            },
-        )
-        logger.info("[%s] [%s] Transitioned to summarizing stage", consumer_name, doc_id)
-
-        # -------------------------------------------------------------
-        # STAGE 2: SUMMARIZATION
-        # -------------------------------------------------------------
-        try:
-            summary = await self.summarizer.summarize_document(pages)
-            finish_iso = datetime.now(UTC).isoformat()
-
-            # Atomically save summary and transition to done
-            pipe = self.redis.pipeline(transaction=True)
-            pipe.set(constants.doc_summary_key(doc_id), summary.encode("utf-8"))
-            pipe.hset(
-                constants.doc_key(doc_id),
-                mapping={
-                    b"status": b"done",
-                    b"finished_at": finish_iso.encode("utf-8"),
-                    b"updated_at": finish_iso.encode("utf-8"),
-                },
-            )
-            await pipe.execute()
-
-            # Acknowledge strictly AFTER both stages succeed
-            await self.redis.xack(
-                constants.STREAM_DOCUMENTS_JOBS, constants.GROUP_DOCUMENTS_WORKERS, msg_id
-            )
-            logger.info(
-                "[%s] [%s] [attempt_%d] Pipeline complete: status done with summary (%d chars)",
-                consumer_name,
-                doc_id,
-                delivery_count,
-                len(summary),
-            )
-
-        except SummaryFailedError as ex:
-            # Permanent summarization failure (e.g. empty text, prompt blocked)
-            await self._handle_permanent_error(
-                doc_id,
-                parser_name,
-                msg_id,
-                ErrorCode.SUMMARY_FAILED,
-                ex.message,
-                consumer_name,
-                delivery_count,
-            )
-        except SummaryRateLimitedError as ex:
-            # Rate limit is transient: retry up to MAX_ATTEMPTS
-            if delivery_count >= settings.MAX_ATTEMPTS:
-                await self._handle_permanent_error(
-                    doc_id,
-                    parser_name,
-                    msg_id,
-                    ErrorCode.SUMMARY_RATE_LIMITED,
-                    ex.message,
-                    consumer_name,
-                    delivery_count,
+        finally:
+            heartbeat_stop.set()
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            # Release lock safely if still held by this consumer
+            try:
+                val = await self.redis.get(lock_key)
+                val_str = (
+                    val.decode("utf-8") if isinstance(val, bytes) else str(val) if val else None
                 )
-            else:
-                await self._handle_transient_error(
-                    doc_id, parser_name, msg_id, ex.message, consumer_name, delivery_count
-                )
-        except (ConnectionError, TimeoutError, RedisError) as ex:
-            await self._handle_transient_error(
-                doc_id, parser_name, msg_id, str(ex), consumer_name, delivery_count
-            )
-        except Exception as ex:
-            logger.error(
-                "[%s] [%s] Unexpected error during summarization: %s",
-                consumer_name,
-                doc_id,
-                ex,
-                exc_info=True,
-            )
-            if delivery_count >= settings.MAX_ATTEMPTS:
-                await self._handle_permanent_error(
-                    doc_id,
-                    parser_name,
-                    msg_id,
-                    ErrorCode.SUMMARY_FAILED,
-                    f"Summarization failed: {str(ex)}",
-                    consumer_name,
-                    delivery_count,
-                )
-            else:
-                await self._handle_transient_error(
-                    doc_id, parser_name, msg_id, str(ex), consumer_name, delivery_count
-                )
+                if val_str == consumer_name:
+                    await self.redis.delete(lock_key)
+            except Exception as e:
+                logger.warning("[%s] [%s] Error releasing lock: %s", consumer_name, doc_id, e)
 
     async def _handle_permanent_error(
         self,

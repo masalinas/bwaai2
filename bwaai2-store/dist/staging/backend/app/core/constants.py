@@ -29,6 +29,11 @@ def doc_summary_key(doc_id: str) -> str:
     return f"doc:{doc_id}:summary"
 
 
+def doc_lock_key(doc_id: str) -> str:
+    """Return the distributed lock key for document processing."""
+    return f"doc:lock:{doc_id}"
+
+
 def worker_heartbeat_key(consumer_name: str) -> str:
     """Return the key storing worker heartbeat."""
     return f"worker:heartbeat:{consumer_name}"

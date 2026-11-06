@@ -31,18 +31,18 @@
 
 ## 5. Verification from Staged Copy
 
-- [ ] 5.1 [store] Execute `delivery/scripts/package.sh` to assemble `dist/staging/` and `dist/bwaai-pdf-processor.zip`.
-- [ ] 5.2 [store] Run `docker compose up --build -d` inside `dist/staging/` and wait for all services to become healthy.
-- [ ] 5.3 [store] Run `test_edge_cases.sh` against the staged stack (status codes, upload limits, corrupted files, missing keys).
-- [ ] 5.4 [store] Run `demo.sh` against the staged stack.
-- [ ] 5.5 [store] Run `load_test.py` with 1 worker instance, record metrics.
-- [ ] 5.6 [store] Scale workers to 3 instances (`docker compose up --scale worker=3 -d`) and run `load_test.py`, record metrics.
-- [ ] 5.7 [store] Test Redis restart durability and worker kill XAUTOCLAIM recovery.
-- [ ] 5.8 [store] Tear down staged deployment with `docker compose down -v`.
+- [x] 5.1 [store] Execute `delivery/scripts/package.sh` to assemble `dist/staging/` and `dist/bwaai-pdf-processor.zip`.
+- [x] 5.2 [store] Run `docker compose up --build -d` inside `dist/staging/` and wait for all services to become healthy.
+- [x] 5.3 [store] Run `test_edge_cases.sh` against the staged stack (status codes, upload limits, corrupted files, missing keys).
+- [x] 5.4 [store] Run `demo.sh` against the staged stack.
+- [x] 5.5 [store] Run `load_test.py` with 1 worker instance, record metrics.
+- [x] 5.6 [store] Scale workers to 3 instances (`docker compose up --scale worker=3 -d`) and run `load_test.py`, record metrics.
+- [x] 5.7 [store] Test Redis restart durability and worker kill XAUTOCLAIM recovery.
+- [x] 5.8 [store] Tear down staged deployment with `docker compose down -v`.
 
 ## 6. Documentation and Review
 
-- [ ] 6.1 [store] Create `delivery/README.md` with system overview, Mermaid diagram, quick start, endpoints, scaling, measured load-test figures, and operational decisions.
-- [ ] 6.2 [store] Update `design.md` with measured load test metrics and review notes.
-- [ ] 6.3 [store] Ensure backend and frontend READMEs are consistent with the root README.
-- [ ] 6.4 [store] Re-run `package.sh` to update `dist/bwaai-pdf-processor.zip` with final documentation.
+- [x] 6.1 [store] Create `delivery/README.md` with system overview, Mermaid diagram, quick start, endpoints, scaling, measured load-test figures, and operational decisions.
+- [x] 6.2 [store] Update `design.md` with measured load test metrics and review notes.
+- [x] 6.3 [store] Ensure backend and frontend READMEs are consistent with the root README.
+- [x] 6.4 [store] Re-run `package.sh` to update `dist/bwaai-pdf-processor.zip` with final documentation.

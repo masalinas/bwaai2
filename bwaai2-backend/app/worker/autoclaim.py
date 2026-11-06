@@ -57,6 +57,24 @@ class AutoClaimer:
                 fields = raw_msg[1]
                 msg_id_str = msg_id.decode("utf-8") if isinstance(msg_id, bytes) else str(msg_id)
 
+                # Check if document is actively locked by another worker
+                doc_id = None
+                for k, v in fields.items():
+                    k_str = k.decode("utf-8") if isinstance(k, bytes) else str(k)
+                    if k_str == "document_id":
+                        doc_id = v.decode("utf-8") if isinstance(v, bytes) else str(v)
+                        break
+
+                if doc_id:
+                    lock_held = await self.redis.exists(constants.doc_lock_key(doc_id))
+                    if lock_held:
+                        logger.warning(
+                            "[%s] Document %s lock is actively held by another worker; skipping autoclaim dispatch",
+                            self.consumer_name,
+                            doc_id,
+                        )
+                        continue
+
                 # Determine delivery count from XPENDING
                 delivery_count = await self._get_delivery_count(msg_id_str)
 

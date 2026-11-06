@@ -150,6 +150,12 @@ During end-to-end container hardening and missing-key testing, the following min
 3. **Worker Container Health Check**:
    - *Issue*: The previous compose health check inspected Redis for `worker:heartbeat:*` keys, which required `redis-py` network connection overhead during every health probe.
    - *Fix*: The worker now writes `/tmp/worker_heartbeat` locally on each loop iteration. The healthcheck probe verifies file freshness, eliminating network roundtrips.
+4. **Worker Distributed Lock and Active Lease Renewal (Duplicate Prevention)**:
+   - *Issue*: When external parsing or summarization calls take longer than `CLAIM_IDLE_MS` (60s), `XAUTOCLAIM` reassigns in-flight jobs to secondary workers, causing duplicate processing, multiplied API costs, and result overwrite races.
+   - *Fix*: Added distributed lock `doc:lock:{doc_id}` (`NX EX 30`) with an active background renewal heartbeat loop running every 10s. The heartbeat loop refreshes the lock TTL and resets the Redis stream PEL message idle time via `XCLAIM ... JUSTID` to prevent premature autoclaiming. The lock is safely released in a `finally` block upon completion or failure. `AutoClaimer` also checks `doc:lock:{doc_id}` before dispatching.
+5. **Worker Crash & Poison-Pill DLQ Guard (Infinite Loop Prevention)**:
+   - *Issue*: Abrupt worker process crashes (OOM kills, `kill -9`, native segfaults) bypass Python exception handling, leaving messages in the stream PEL to be repeatedly redelivered without ever hitting the DLQ handler.
+   - *Fix*: Added pre-execution entry guard in `JobProcessor.process_message`: if `delivery_count > settings.MAX_ATTEMPTS`, the worker immediately marks the document as `failed` with code `PARSER_FAILED`, logs to `documents:dead`, and calls `xack` without re-executing parsing.
 
 ---
 

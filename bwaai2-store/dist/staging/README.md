@@ -230,6 +230,10 @@ Benchmarks executed against the staged Docker Compose stack using `scripts/load_
    - Nginx is tuned with `client_max_body_size 300M` and `proxy_request_buffering off` to allow full 10-file batch uploads up to 25MB each without premature gateway rejection.
 5. **Zero Host Network Dependency**:
    - The frontend, API, worker, and Redis communicate entirely over an internal bridge network.
+6. **Distributed Mutual Exclusion & Active Lease Renewal**:
+   - To prevent long-running AI API calls (> 60s) from being prematurely reassigned by `XAUTOCLAIM` and duplicated across multiple workers, workers acquire `doc:lock:{id}` (`NX EX 30`) and execute an active background heartbeat that renews the lock TTL and resets the stream message's pending idle time via `XCLAIM ... JUSTID` every 10 seconds. `AutoClaimer` also checks for active locks before dispatching.
+7. **Poison-Pill Crash Protection & DLQ Routing**:
+   - Fatal worker process crashes (OOM kills, `kill -9`, native segfaults) bypass Python `try...except` exception handlers. A pre-execution entry guard inspects `delivery_count > MAX_ATTEMPTS` before parsing starts; if exceeded, the job is immediately marked `failed` with code `PARSER_FAILED`, published to the dead-letter stream `documents:dead`, and acknowledged via `XACK` to break infinite crash loops.
 
 ---
 
